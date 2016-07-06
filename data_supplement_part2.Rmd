@@ -1,0 +1,280 @@
+---
+title: 'Data supplement: Natural language processing to assess documentation of features of critical illness in discharge documents of patients with ARDS'
+author:
+- Gary E. Weissman, MD
+- Michael O. Harhay, MPH
+- Ricardo M. Lugo, MD
+- Barry D. Fuchs, MD, MS
+- Scott D. Halpern, MD, PhD
+- Mark E. Mikkelsen, MD, MSCE
+date: "\today{}"
+output: word_document
+csl: ../new_manuscript/ajrccm-also-annalsats.csl
+bibliography: ../new_manuscript/ards_text.bib
+---
+
+# Part 2: Detailed Methods - Natural Language Processing Code
+
+## Introduction
+
+This data supplement is meant to provide the reader with a detailed, step-by-step description of the methods used in our manuscript. Because we are not permitted to share even anonymized patient data from our study, yet seeing the data itself is the motivator for the analysis, we have created a sample data set here to be used as an example. You will see the sample data set generated randomly below. However, the methods used to analyze the text with natural language processing (NLP) tools are repeated here in the exact manner as used in our original analysis. For any further specific code inquiries please contact the authors directly.
+
+We will use the `R` language for statistical computing [@R-Core-Team:2013hi] and associated packages, all of which are freely available.
+
+## Create data
+
+Here we will randomly generate a data set analogous to that used in our example analysis.
+
+
+```{r setup, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(results = 'hide', message = FALSE, warning = FALSE)
+# load libraries
+require(data.table) # for fast data structures
+require(dplyr) # for clear data manipulation notation
+require(tidyr) # for wide/long transformations
+require(ggplot2) # for plotting
+require(tm) # for text mining
+options(mc.cores = 1) # prevent buggy tm errors
+require(RWeka) # for tokenizing
+require(SnowballC) # for stemming algorithm
+require(stringdist) # for string matching, sensitivity analysis
+```
+
+```{r create-data}
+
+# set up data options - make up some patient names and clinical histories
+fnames <- c('Zora', 'Willa', 'Iris', 'Alice', 'Ernest', 'William', 'Orhan', 
+            'Boris', 'Pablo', 'Jose', 'E.B.', 'Toni', 'J.D.', 'Mark', 
+            'Virginia', 'John', 'Harper', 'Maya', 'Gabriel', 'Roald', 'Lloyd',
+            'Haruki', 'Aldous', 'Sylvia', 'Ernest', 'Charles', 'Anton', 'Tom')
+lnames <- c('Neale Hurston', 'Cather', 'Murdoch', 'Munro', 'Hemingway', 
+            'Shakespeare', 'Pamuk', 'Pasternak', 'Neruda', 'Saramago', 'White',
+            'Morrison', 'Salinger', 'Twain', 'Woolf', 'Steinbeck', 'Lee', 
+            'Angelou', 'Garcia Marquez', 'Dahl', 'Alexander', 'Murakami',
+            'Huxley', 'Plath', 'Hemingway', 'Dickens', 'Chekhov', 'Stoppard')
+ 
+comorbid1 <- c('hypertension', 'diabetes', 'coronary artery disease', 
+               'hyperlipidemia')
+comorbid2 <- c( 'COPD', 'asthma', 'interstitial lung disease', 'bronchiectasis')
+
+
+# Include some options for spelling errors here.
+# In the case of human genereated, keyboard entered text,
+# consider possibility of both orthographic and typographic errors
+# try a transposition, deletion, insertion
+dxA <- c('ARDS', 'acute respiratory distress syndrome', 
+            'acute respiratroy distress syndrome',
+            'dyspnea', 'difficulty breathing', 'shortness of breath',
+            'shortness of breathe')
+dxB <- c('mechanical ventilation', 'mechanical ventlation',
+            'a ventilator' , 'help breathing')
+dxC <- c('critically ill', 'very sick', 'toxic')
+dxD <- c('depression', 'anxiety', 'delirium', 'nausea', 'vomiting', 'pain', 'PTSD')
+
+# generate a population
+pop.dat <- data.table(expand.grid(fnames, lnames))
+setnames(pop.dat, c('fname', 'lname'))        
+
+N <- nrow(pop.dat)
+pop.dat <- data.table(ptid = 1:N,
+                      pop.dat,
+                      cmd1 = sample(comorbid1, N, T),
+                      cmd2 = sample(comorbid2, N, T),
+                      gender = sample(1:2, N, T),
+                      wdxA = sample(dxA, N, T),
+                      wdxB = sample(dxB, N, T),
+                      wdxC = sample(dxC, N, T),
+                      wdxD = sample(dxD, N, T),
+                      age = round(rnorm(N, 50, 10)))
+                      
+# now make a discharge summary for this population
+# this is like Mad Libs
+genDCSummary <- function(fname, lname, cmd1, cmd2, wdxA, wdxB, wdxC, wdxD, gender, age) {
+  
+  paste0(fname, ' ', lname, ' is a ', age, ' year old ',
+        c('male','female')[gender], ' with a history of ',
+        cmd1, ' and ', cmd2, ' who was admitted to the hospital with ', 
+        wdxA, '. During the hospital course, ', c('he','she')[gender], 
+        ' required ', wdxB, ' because ', c('he','she')[gender], ' was ',
+        wdxC, '. The patient was also noted to have significant ',
+        wdxD, ' during the course of the hospital stay. ', 
+        c('He','She')[gender], 
+        ' recovered and was discharged home in good condition.')
+}
+
+# And finally generate the discharge summary for each person
+dc.sum.vector <- pop.dat[, genDCSummary(fname, lname, cmd1, cmd2, wdxA, wdxB, 
+                                        wdxC, wdxD, gender, age),
+                         by = ptid]$V1
+```
+
+```{r printexample, results='asis'}
+# Here is an example of one of the discharge documents:
+print(dc.sum.vector[sample(1:length(dc.sum.vector),size=1)])
+
+```
+
+
+## Natural language processing
+
+Now that we have a corpus of text, we can start pre-processing the data to get it into a usable format.
+
+## Pre-processing
+
+```{r preprocessing}
+# turn the character vector into a "corpus" format
+corpus.raw <- VCorpus(VectorSource(dc.sum.vector))
+
+# now let's process the text
+corpus.proc <- tm_map(corpus.raw, content_transformer(tolower)) # make all lowercase
+corpus.proc <- tm_map(corpus.proc, stripWhitespace) # remove extra whitespace
+corpus.proc <- tm_map(corpus.proc, removeWords, stopwords("english")) # remove stopwords
+corpus.proc <- tm_map(corpus.proc, removePunctuation)
+corpus.proc <- tm_map(corpus.proc, removeNumbers)
+
+# now create DTM for unstemmed words (to be used for acronyms)
+# we don't want to stem acronyms since they might be confused with other words
+dtm.nostem.acro <- DocumentTermMatrix(corpus.proc, 
+                                              list(dictionary = c('ards', 'ptsd')))
+
+# now we'll stem the processed corpus to enable capture of slight variants, 
+# minor spelling errors (mostly at the end)
+# e.g. will condense "extubate" and "extubated" both to "extub"
+corpus.stem <- tm_map(corpus.proc, stemDocument)
+
+# make tokenizer for n = 1 to 4
+# since our "keywords range from 1-4 words
+wordTokenizer_1_4 <- function(x) RWeka::NGramTokenizer (x, RWeka::Weka_control(min=1,max=4))
+
+# decide which groups of words we're interested in
+grpA <- c('ards', 'acute respiratory distress syndrome') # note ards is acronym
+grpB <- c('mechanical ventilation', 'ventilator')
+grpC <- c('critically ill', 'intensive care unit')
+grpD <- c('depression', 'anxiety', 'ptsd') # note ptsd is acronym
+
+# create a DTM for the primary terms on stemmed words for each group
+
+grpA.stem <- as.vector(sapply(tm_map(VCorpus(VectorSource(grpA[-1])), stemDocument),
+                         as.character))
+grpB.stem <- as.vector(sapply(tm_map(VCorpus(VectorSource(grpB)), stemDocument),
+                         as.character))
+grpC.stem <- as.vector(sapply(tm_map(VCorpus(VectorSource(grpC)), stemDocument),
+                         as.character))
+grpD.stem <- as.vector(sapply(tm_map(VCorpus(VectorSource(grpD[-3])), stemDocument),
+                         as.character))
+
+
+# now create a DTM for all non-acronym keywords against the stemmed corpus
+dtm.stem.words <- DocumentTermMatrix(corpus.stem, control =
+                                              list(
+                                                tokenize = wordTokenizer_1_4,
+                                                dictionary = c(grpA.stem,
+                                                                  grpB.stem,
+                                                                  grpC.stem,
+                                                                  grpD.stem)))
+
+# create separate DTMs for each term category for convenience - in data.table
+dtm.all.grpA <- as.data.table(cbind(inspect(dtm.stem.words[,grpA.stem]),
+                                    inspect(dtm.nostem.acro[,'ards'])))
+dtm.all.grpB <- as.data.table(inspect(dtm.stem.words[,grpB.stem]))
+dtm.all.grpC <- as.data.table(inspect(dtm.stem.words[,grpC.stem]))
+dtm.all.grpD <- as.data.table(cbind(inspect(dtm.stem.words[,grpD.stem]), 
+                                    inspect(dtm.nostem.acro[,'ptsd'])))
+
+# now create summary plots for keyword appearance in each group
+dtm.all.grpA  %>%
+  summarise_each(funs(mean)) %>%
+  gather() %>%
+  rename(term = key, proportion = value) %>%
+  ggplot(aes(x = term, y = proportion)) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  theme_minimal() +
+  ggtitle('Proportion of documents with Group A terms')
+
+dtm.all.grpB  %>%
+  summarise_each(funs(mean)) %>%
+  gather() %>%
+  rename(term = key, proportion = value) %>%
+  ggplot(aes(x = term, y = proportion)) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  theme_minimal() +
+  ggtitle('Proportion of documents with Group B terms')
+
+dtm.all.grpC  %>%
+  summarise_each(funs(mean)) %>%
+  gather() %>%
+  rename(term = key, proportion = value) %>%
+  ggplot(aes(x = term, y = proportion)) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  theme_minimal() +
+  ggtitle('Proportion of documents with Group C terms')
+
+dtm.all.grpD  %>%
+  summarise_each(funs(mean)) %>%
+  gather() %>%
+  rename(term = key, proportion = value) %>%
+  ggplot(aes(x = term, y = proportion)) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  theme_minimal() +
+  ggtitle('Proportion of documents with Group D terms')
+
+
+```
+
+## Sensitivity analysis
+
+See Part 1 of this supplement for a detailed explanation of the chosen approach. Below find the code we used to implement this approach:
+
+```{r sensan}
+
+allterms <- sort(c(grpA, grpB, grpC, grpD))
+
+# create a list of all terms from the unstemmed corpus, including all 1 - 4 ngrams
+allwords.nostem <- Terms(DocumentTermMatrix(corpus.proc, 
+                                            control = list(tokenize = wordTokenizer_1_4)))
+
+# now compare each of our keywords with each term by string similarity
+stringcomps <- lapply(allterms, function(term) sapply(term, stringsim, allwords.nostem))
+syndict <- as.data.table(do.call(cbind, stringcomps))
+syndict[, term := allwords.nostem]
+
+# visualize similarity profiles
+opar <- par()
+par(mfrow=c(3,3))
+lapply(1:(ncol(syndict)-1), function(d) {
+  plot(main = paste0(names(syndict)[d]), cex.main = 0.7,
+       density(unlist(syndict[term != names(syndict)[d],d,with=F]), adjust = 0.1), 
+       log = 'y', xlim = c(0,1), xlab = 'string similarity',
+       ylab = 'log density')
+  abline(v=0.9,col='red')
+})
+par(opar)
+
+
+```
+
+The similarity plots show the log of the density of string similarity for each term across every n-gram in the corpus. The red vertical line marks an arbitrary cutoff of 0.9 which we determined to have reasonable discrimination for finding appropriate matches and was used for our sensitivity analysis. Only the terms "acute respiratory distress syndrome" and "mechanical ventilation" have similar string matches above this threshold. Find the similar matched terms below:
+
+```{r lookatmatches, results='show'}
+
+table(syndict[`acute respiratory distress syndrome` >= 0.9 & 
+                term != "acute respiratory distress syndrome"]$term)
+table(syndict[`mechanical ventilation` >= 0.9 & 
+                term != "mechanical ventilation"]$term)
+
+```
+
+For each term, our fuzzy matching approach captured the errors purposefully introduced above to simulate common spelling mistakes in human generated, keyboard entered text.
+
+## Session Information
+
+```{r sessioninfo, results = 'show'}
+sessionInfo()
+```
+
+
+# References
